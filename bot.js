@@ -1,7 +1,7 @@
 // ============================================================================
 // BOT.JS — DISCORD BOT WITH ONBOARDING ROLES, NICKNAME BADGES, LEVELING (TEXT+VOICE)
 // CHANNEL ROUTING + ERROR-ONLY LOGGING + SEPARATE TOPS (TEXT / VOICE)
-// + AUTO CHAMPION BADGES (TOP 3 TOTAL) ON NICKNAMES
+// 
 // REQUIREMENTS: Node 18+, discord.js v14, dotenv, ms, express
 // SETUP:
 //   npm init -y
@@ -26,7 +26,7 @@ const NEWBIE_BADGE = '🐣';
 const NPC_BADGE = '🤖';
 const NEWBIE_DURATION_MS = 14 * 24 * 60 * 60 * 1000; // 14 DAYS
 
-// CHAMPION BADGES (TOTAL TOP 3)
+// (CHAMPION MEDALS FEATURE REMOVED)
 const CHAMP_BADGES = ['🥇', '🥈', '🥉']; // index 0->#1, 1->#2, 2->#3
 
 // CHANNEL ROUTING (EXACT NAMES)
@@ -39,6 +39,10 @@ const MESSAGE_XP = 15; // PER MESSAGE (WITH COOLDOWN)
 const VOICE_XP_PER_MIN = 5; // PER MINUTE IN VOICE
 const MESSAGE_COOLDOWN_MS = 60 * 1000; // 1 MIN PER USER
 
+// CROWN ROLES FOR TOP TEXT/VOICE
+const TEXT_CHAMP_ROLE_NAME = '⌨ Spam Lord';
+const VOICE_CHAMP_ROLE_NAME = '🎙 Yap Lord';
+
 // ============================================================================
 // PERSISTENCE (JSON FILE DB)
 // ============================================================================
@@ -48,7 +52,7 @@ function loadData() {
 }
 let DB = loadData();
 // DB SHAPE:
-// DB.members: { [guildId:userId]: { joinedAt, newbieSince, originalNick|null, champRank?: 0|1|2|null } }
+// DB.members: { [guildId:userId]: { joinedAt, newbieSince, originalNick|null } }
 // DB.xp: { [guildId:userId]: { xp:number, text?:number, voice?:number } }
 let saveTimer;
 function saveData() {
@@ -124,12 +128,13 @@ const commands = [
   new SlashCommandBuilder().setName('toptext').setDescription('Top 10 by text XP on this server.'),
   new SlashCommandBuilder().setName('topvoice').setDescription('Top 10 by voice XP on this server.'),
 
-  // ADMIN: FORCE UPDATE OF CHAMPION BADGES
+  // ADMIN: recompute & assign crown roles (top text/voice)
   new SlashCommandBuilder()
-    .setName('refreshtopbadges')
-    .setDescription('Recompute and apply nickname badges for Top 3 (total).')
+    .setName('refreshcrowns')
+    .setDescription('Recompute and assign ⌨ Spam Lord (text) & 🎙 Yap Lord (voice).')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-].map(c => c.toJSON());
+
+  ].map(c => c.toJSON());
 
 // ============================================================================
 // COMMAND REGISTRATION (GUILD-SCOPED FOR DEV)
@@ -160,12 +165,16 @@ const client = new Client({
   partials: [Partials.GuildMember, Partials.User],
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   // STARTUP TASKS
   startVoiceTicker();
   startNewbieSweep();
-  startChampionSweep();
+  // initial crowns for all guilds
+  for (const [, guild] of client.guilds.cache) {
+    await updateCrownRoles(guild).catch(() => {});
+  }
+  startCrownSweep();
 });
 
 // ============================================================================
@@ -214,14 +223,14 @@ function addXP(guildId, userId, amount, source) {
   return { before: before, after: entry.xp, levelUp: lvlAfter > lvlBefore, newLevel: lvlAfter };
 }
 
-// BADGE HELPERS (CHAMP + ROLE)
+// BADGE HELPERS (ROLE ONLY)
 function stripKnownBadges(name) {
   if (!name) return name;
   let n = name.trim();
-  // remove leading badges like "🥇 " or "🤖 "
-  n = n.replace(/^((🐣|🤖|🥇|🥈|🥉) )+/u, '');
-  // remove trailing badges like " 🥇"
-  n = n.replace(/( (🐣|🤖|🥇|🥈|🥉))+$/u, '');
+  // remove leading known badges (role + crowns)
+  n = n.replace(/^((🐣|🤖|🥇|🥈|🥉|⌨|🎙) )+/u, '');
+  // remove trailing known badges
+  n = n.replace(/( (🐣|🤖|🥇|🥈|🥉|⌨|🎙))+$/u, '');
   return n.trim();
 }
 function getRoleBadge(member) {
@@ -229,19 +238,20 @@ function getRoleBadge(member) {
   if (member.roles.cache.find(r => r.name === NPC_ROLE_NAME)) return NPC_BADGE;
   return null;
 }
-async function setNickWithBadges(member, champRank /* 0|1|2|null */) {
-  // PLACE ROLE BADGE AT START, MEDAL AT END (e.g., "🤖 Username 🥇")
+async function setNickRoleBadge(member) {
+  // PREFIX ORDER: role badge first (🐣/🤖), then crowns (⌨, 🎙), then name
   try {
     const current = member.nickname ?? member.user.globalName ?? member.user.username;
     const base = stripKnownBadges(current);
     const roleBadge = getRoleBadge(member);
-    const champBadge = (champRank !== null && champRank !== undefined && champRank >= 0 && champRank <= 2)
-      ? CHAMP_BADGES[champRank]
-      : null;
-
-    const prefix = roleBadge ? roleBadge + ' ' : '';
-    const suffix = champBadge ? ' ' + champBadge : '';
-    const finalNick = (prefix + base + suffix).slice(0, 32);
+    const hasTextCrown = member.roles.cache.some(r => r.name === TEXT_CHAMP_ROLE_NAME);
+    const hasVoiceCrown = member.roles.cache.some(r => r.name === VOICE_CHAMP_ROLE_NAME);
+    const icons = [];
+    if (roleBadge) icons.push(roleBadge);
+    if (hasTextCrown) icons.push('⌨');
+    if (hasVoiceCrown) icons.push('🎙');
+    const prefix = icons.length ? icons.join(' ') + ' ' : '';
+    const finalNick = (prefix + base).slice(0, 32);
     if (finalNick !== current) await member.setNickname(finalNick).catch(() => {});
   } catch { /* ignore perms/hierarchy issues */ }
 }
@@ -265,7 +275,7 @@ client.on('guildMemberAdd', async (member) => {
   saveData();
 
   // PREFIX NICKNAME WITH BADGE (IF POSSIBLE)
-  await setNickWithBadges(member, DB.members[key]?.champRank ?? null);
+  await setNickRoleBadge(member);
 
   // ARRIVAL MESSAGE → ARRIVAL CHANNEL; FALLBACK TO /SETWELCOME CONFIG
   const arrival = getArrivalChannel(guild);
@@ -305,7 +315,7 @@ async function promoteIfDue(guild) {
       try { await member.roles.remove(newbieRole, 'Newbie period ended'); } catch {}
       try { await member.roles.add(npcRole, 'Promoted to NPC'); } catch {}
       // BADGE SWAP (KEEPS CHAMP BADGE IF ANY)
-      await setNickWithBadges(member, meta.champRank ?? null);
+      await setNickRoleBadge(member);
       // MARK AS PROCESSED
       meta.newbieSince = null;
       DB.members[key] = meta; saveData();
@@ -327,56 +337,118 @@ function startNewbieSweep() {
 }
 
 // ============================================================================
-// FEATURE: CHAMPION BADGES — COMPUTE TOP 3 TOTAL & APPLY NICK BADGES
+// CROWN ROLES — TOP TEXT / TOP VOICE
+//  - Assign ⌨ Spam Lord to highest text XP
+//  - Assign 🎙 Yap Lord to highest voice XP
+//  - Ensures roles exist and tries to position them high (just below Admin and
+//    within the bot's control). Remove from previous holders.
 // ============================================================================
-function computeTop3Map(guildId) {
-  const entries = Object.entries(DB.xp)
-    .filter(([k]) => k.startsWith(guildId + ':'))
-    .map(([k, v]) => ({ userId: k.split(':')[1], xp: (v?.xp ?? 0) }))
-    .sort((a, b) => b.xp - a.xp)
-    .slice(0, 3);
-  const map = new Map(); // userId -> champRank (0,1,2)
-  entries.forEach((e, i) => map.set(e.userId, i));
-  return map;
+async function ensureCrownRoles(guild) {
+  let textRole = guild.roles.cache.find(r => r.name === TEXT_CHAMP_ROLE_NAME);
+  if (!textRole) textRole = await guild.roles.create({ name: TEXT_CHAMP_ROLE_NAME, hoist: true, reason: 'Top text crown' }).catch(() => null);
+  let voiceRole = guild.roles.cache.find(r => r.name === VOICE_CHAMP_ROLE_NAME);
+  if (!voiceRole) voiceRole = await guild.roles.create({ name: VOICE_CHAMP_ROLE_NAME, hoist: true, reason: 'Top voice crown' }).catch(() => null);
+  if (!textRole || !voiceRole) return { textRole, voiceRole };
+
+  // Try to set Unicode emoji icons on the roles (server must support role icons)
+  try { await textRole.setIcon('⌨').catch(() => {}); } catch {}
+  try { await voiceRole.setIcon('🎙').catch(() => {}); } catch {}
+
+
+  // Try to push them high in the stack: just below the top Admin role but not above the bot's highest
+  try {
+    const botMember = await guild.members.fetchMe();
+    const botTop = botMember.roles.highest;
+    const adminTop = guild.roles.cache
+      .filter(r => r.permissions.has(PermissionFlagsBits.Administrator))
+      .sort((a, b) => b.position - a.position)
+      .first();
+    let target = Math.min(botTop.position - 1, adminTop ? (adminTop.position - 1) : (botTop.position - 1));
+    target = Math.max(target, 1);
+    await textRole.setPosition(target).catch(() => {});
+    await voiceRole.setPosition(target).catch(() => {});
+  } catch {}
+  return { textRole, voiceRole };
 }
 
-async function updateTopBadges(guild) {
-  const champMap = computeTop3Map(guild.id);
-  const processed = new Set();
+function topBy(guildId, key) {
+  // key: 'text' | 'voice'
+  const arr = Object.entries(DB.xp)
+    .filter(([k]) => k.startsWith(guildId + ':'))
+    .map(([k, v]) => ({ userId: k.split(':')[1], xp: (v?.[key] ?? 0) }))
+    .sort((a, b) => b.xp - a.xp);
+  return arr[0] || null;
+}
 
-  // APPLY TO CURRENT TOP3
-  for (const [userId, rank] of champMap.entries()) {
-    const member = await guild.members.fetch(userId).catch(() => null);
-    if (!member) continue;
-    const key = mkey(guild.id, userId);
-    const meta = DB.members[key] || {};
-    meta.champRank = rank;
-    DB.members[key] = meta; saveData();
-    await setNickWithBadges(member, rank);
-    processed.add(userId);
+async function updateCrownRoles(guild) {
+  const { textRole, voiceRole } = await ensureCrownRoles(guild);
+  if (!textRole || !voiceRole) return;
+
+  const prevTextId = textRole.members.first()?.id || null;
+  const prevVoiceId = voiceRole.members.first()?.id || null;
+
+  const topText = topBy(guild.id, 'text');
+  const topVoice = topBy(guild.id, 'voice');
+
+  const newTextId = topText && (topText.xp || 0) > 0 ? topText.userId : null;
+  const newVoiceId = topVoice && (topVoice.xp || 0) > 0 ? topVoice.userId : null;
+
+  async function assign(role, winnerId) {
+    const members = await guild.members.fetch();
+    for (const m of members.values()) {
+      if (m.roles.cache.has(role.id) && m.id !== winnerId) {
+        await m.roles.remove(role).catch(() => {});
+        await setNickRoleBadge(m);
+      }
+    }
+    if (winnerId) {
+      const wm = await guild.members.fetch(winnerId).catch(() => null);
+      if (wm && !wm.roles.cache.has(role.id)) {
+        await wm.roles.add(role, 'Crown role assignment').catch(() => {});
+      }
+      if (wm) await setNickRoleBadge(wm);
+    }
   }
 
-  // REMOVE BADGE FROM PREVIOUS CHAMPS WHO DROPPED OUT
-  for (const [key, meta] of Object.entries(DB.members)) {
-    const [gId, uId] = key.split(':');
-    if (gId !== guild.id) continue;
-    if (meta && (meta.champRank === 0 || meta.champRank === 1 || meta.champRank === 2) && !processed.has(uId)) {
-      // now out of top3
-      meta.champRank = null;
-      DB.members[key] = meta; saveData();
-      const member = await guild.members.fetch(uId).catch(() => null);
-      if (member) await setNickWithBadges(member, null);
+  await assign(textRole, newTextId);
+  await assign(voiceRole, newVoiceId);
+
+  // Announcements
+  const lvlCh = getLevelUpChannel(guild);
+  if (!lvlCh) return;
+
+  // Double-crown announcement if both changed and go to same user
+  if (newTextId !== prevTextId && newVoiceId !== prevVoiceId && newTextId && newTextId === newVoiceId) {
+    const member = await guild.members.fetch(newTextId).catch(() => null);
+    if (member) lvlCh.send({ content: `👑 Double crown: ${member} now rules **chat** ⌨ and **voice** 🎙. Bow or cope.` }).catch(() => {});
+    return;
+  }
+
+  if (newTextId !== prevTextId) {
+    if (newTextId) {
+      const winner = await guild.members.fetch(newTextId).catch(() => null);
+      if (winner) lvlCh.send({ content: `⌨ New **Spam Lord**: ${winner} just snatched #1 in chat.` }).catch(() => {});
+    } else {
+      lvlCh.send({ content: `⌨ **Spam Lord** crown is now vacant. Type harder.` }).catch(() => {});
+    }
+  }
+
+  if (newVoiceId !== prevVoiceId) {
+    if (newVoiceId) {
+      const winner = await guild.members.fetch(newVoiceId).catch(() => null);
+      if (winner) lvlCh.send({ content: `🎙 New **Yap Lord**: ${winner} just took #1 in voice.` }).catch(() => {});
+    } else {
+      lvlCh.send({ content: `🎙 **Yap Lord** crown is now vacant. VC is quiet… too quiet.` }).catch(() => {});
     }
   }
 }
 
-function startChampionSweep() {
-  // UPDATE TOP BADGES HOURLY
+function startCrownSweep() {
   setInterval(async () => {
     for (const [, guild] of client.guilds.cache) {
-      await updateTopBadges(guild).catch(() => {});
+      await updateCrownRoles(guild).catch(() => {});
     }
-  }, 60 * 60 * 1000);
+  }, 60 * 60 * 1000); // hourly
 }
 
 // ============================================================================
@@ -440,7 +512,7 @@ function startVoiceTicker() {
 }
 
 // ============================================================================
-// FEATURE: SLASH COMMAND HANDLER (PING / SETWELCOME / TEMPROLE / GOODBYE / RANK / LEADERBOARD / TOPTEXT / TOPVOICE / REFRESHTOPBADGES)
+// FEATURE: SLASH COMMAND HANDLER (PING / SETWELCOME / TEMPROLE / GOODBYE / RANK / LEADERBOARD / TOPTEXT / TOPVOICE)
 // ============================================================================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -640,13 +712,13 @@ client.on('interactionCreate', async (interaction) => {
     return void interaction.reply({ embeds: [embed] });
   }
 
-  // COMMAND: /REFRESHTOPBADGES (ADMIN)
-  if (interaction.commandName === 'refreshtopbadges') {
+    // COMMAND: /REFRESHCROWNS (ADMIN)
+  if (interaction.commandName === 'refreshcrowns') {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
       return void interaction.reply({ content: 'You need **Manage Server** to do that.', ephemeral: true });
     }
-    await updateTopBadges(interaction.guild);
-    return void interaction.reply({ content: '✅ Top badges refreshed.', ephemeral: true });
+    await updateCrownRoles(interaction.guild);
+    return void interaction.reply({ content: '✅ Crowns updated: ⌨ Spam Lord & 🎙 Yap Lord assigned.', ephemeral: true });
   }
 });
 
@@ -681,6 +753,16 @@ client.on('shardError', (err) => {
   }
 });
 
+// Catch truly uncaught exceptions so the process doesn't die silently
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception', err);
+  for (const [, guild] of client.guilds.cache) {
+    getLogChannel(guild)?.send({ content: `💥 Uncaught exception: ${String(err)}` }).catch(() => {});
+  }
+});
+  }
+});
+
 // ============================================================================
 // FEATURE: KEEP-ALIVE WEB SERVER (RENDER FREE)
 // - Exposes / and /health endpoints so Render Free treats this as a Web Service
@@ -695,7 +777,10 @@ function startWebServer() {
   });
 
   app.get('/health', (req, res) => {
-    res.json({ ok: true, uptime: process.uptime(), guilds: client.guilds.cache.size || 0 });
+    const ua = req.get('user-agent') || 'unknown';
+    const now = new Date().toISOString();
+    console.log(`💓 /health ping @ ${now} — ua=${ua}`);
+    res.json({ ok: true, ts: now, uptime: process.uptime(), guilds: client.guilds.cache.size || 0 });
   });
 
   app.listen(PORT, () => console.log(`🌐 HTTP server listening on :${PORT}`));
@@ -704,7 +789,7 @@ function startWebServer() {
   if (SELF_PING_URL) {
     setInterval(() => {
       fetch(SELF_PING_URL).catch(() => {}); // keep-alive ping
-    }, 4 * 60 * 1000); // every 4 minutes
+    }, 4 * 60 * 1000);
   }
 }
 
