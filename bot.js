@@ -26,8 +26,7 @@ const NEWBIE_BADGE = '🐣';
 const NPC_BADGE = '🤖';
 const NEWBIE_DURATION_MS = 14 * 24 * 60 * 60 * 1000; // 14 DAYS
 
-// (CHAMPION MEDALS FEATURE REMOVED)
-const CHAMP_BADGES = ['🥇', '🥈', '🥉']; // index 0->#1, 1->#2, 2->#3
+// (champion medals removed)
 
 // CHANNEL ROUTING (EXACT NAMES)
 const LOG_CHANNEL_NAME = 'ℹ️᲼𝕃ogs';
@@ -351,11 +350,9 @@ async function ensureCrownRoles(guild) {
   if (!textRole || !voiceRole) return { textRole, voiceRole };
 
   // Try to set Unicode emoji icons on the roles (server must support role icons)
-  try { await textRole.setIcon('⌨').catch(() => {}); } catch {}
-  try { await voiceRole.setIcon('🎙').catch(() => {}); } catch {}
-
-
-  // Try to push them high in the stack: just below the top Admin role but not above the bot's highest
+  try { await textRole.setUnicodeEmoji?.('⌨'); } catch {}
+  try { await voiceRole.setUnicodeEmoji?.('🎙'); } catch {}
+// Try to push them high in the stack: just below the top Admin role but not above the bot's highest
   try {
     const botMember = await guild.members.fetchMe();
     const botTop = botMember.roles.highest;
@@ -760,9 +757,6 @@ process.on('uncaughtException', (err) => {
     getLogChannel(guild)?.send({ content: `💥 Uncaught exception: ${String(err)}` }).catch(() => {});
   }
 });
-  }
-});
-
 // ============================================================================
 // FEATURE: KEEP-ALIVE WEB SERVER (RENDER FREE)
 // - Exposes / and /health endpoints so Render Free treats this as a Web Service
