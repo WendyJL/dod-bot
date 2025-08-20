@@ -38,6 +38,13 @@ const MESSAGE_XP = 15; // PER MESSAGE (WITH COOLDOWN)
 const VOICE_XP_PER_MIN = 5; // PER MINUTE IN VOICE
 const MESSAGE_COOLDOWN_MS = 60 * 1000; // 1 MIN PER USER
 
+// XP CURVE (EXPONENTIAL): XP needed per level grows by a multiplier
+// Level 1 requires XP_BASE; each next level requires previous * XP_GROWTH
+// Cumulative XP to reach level N is geometric sum
+const XP_BASE = 100;    // XP required for level 1
+const XP_GROWTH = 1.25; // multiplier per level (e.g., 1.25 = +25% per level)
+
+
 // CROWN ROLES FOR TOP TEXT/VOICE
 const TEXT_CHAMP_ROLE_NAME = '⌨ Spam Lord';
 const VOICE_CHAMP_ROLE_NAME = '🎙 Yap Lord';
@@ -85,6 +92,12 @@ function getTextChannelByName(guild, name) {
 }
 function getLogChannel(guild) { return getTextChannelByName(guild, LOG_CHANNEL_NAME); }
 function getLevelUpChannel(guild) { return getTextChannelByName(guild, LEVELUP_CHANNEL_NAME); }
+
+// Safe sender for Level-Up messages: try #LevelUp, else fallback channel or logs
+function safeSendLevelUp(guild, payload, fallbackChannel = null) {
+  const ch = getLevelUpChannel(guild) || fallbackChannel || getLogChannel(guild);
+  if (ch) ch.send(payload).catch(() => {});
+}
 function getArrivalChannel(guild) { return getTextChannelByName(guild, ARRIVAL_CHANNEL_NAME); }
 
 // ============================================================================
@@ -125,7 +138,24 @@ const commands = [
 
   // PUBLIC LEADERBOARDS (TEXT / VOICE)
   new SlashCommandBuilder().setName('toptext').setDescription('Top 10 by text XP on this server.'),
-  new SlashCommandBuilder().setName('topvoice').setDescription('Top 10 by voice XP on this server.'),
+  new SlashCommandBuilder().setName('topvoice').setDescription('Top 10 by voice XP on this server.'),  // ADMIN: grant XP for testing
+  new SlashCommandBuilder()
+    .setName('givexp')
+    .setDescription('Grant XP to a user (admin only) for testing level-ups).')
+    .addUserOption(o => o.setName('user').setDescription('Target user').setRequired(true))
+    .addIntegerOption(o => o.setName('amount').setDescription('XP amount').setRequired(true))
+    .addStringOption(o => o.setName('source').setDescription('XP source').addChoices(
+      { name: 'text', value: 'text' },
+      { name: 'voice', value: 'voice' }
+    ))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  // ADMIN: reset all XP for this server (irreversible)
+  new SlashCommandBuilder()
+    .setName('resetxp')
+    .setDescription('Reset ALL XP (text+voice) on this server to 0. Irreversible.')
+    .addBooleanOption(o => o.setName('confirm').setDescription('Must be true to confirm').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // ADMIN: recompute & assign crown roles (top text/voice)
   new SlashCommandBuilder()
@@ -187,15 +217,35 @@ async function ensureRole(guild, name) {
   return role;
 }
 
+function totalXpForLevel(level) {
+  // Cumulative XP required to reach `level` (level 0 = 0)
+  if (level <= 0) return 0;
+  if (XP_GROWTH === 1) return Math.ceil(XP_BASE * level); // fallback linear
+  return Math.ceil(XP_BASE * (Math.pow(XP_GROWTH, level) - 1) / (XP_GROWTH - 1));
+}
+
+function xpNeededForLevel(level) {
+  // XP needed to go from level-1 to `level`
+  if (level <= 0) return 0;
+  return Math.ceil(XP_BASE * Math.pow(XP_GROWTH, level - 1));
+}
+
 function calcLevel(xp) {
-  // PROGRESSIVE CURVE: LEVEL N WHEN XP >= 100 * N^1.5
+  // Find the highest level where totalXpForLevel(level) <= xp
   let n = 0;
-  while (100 * Math.pow(n + 1, 1.5) <= xp) n++;
+  // Fast path: exponential growth allows logarithmic estimate
+  if (xp > 0 && XP_GROWTH !== 1) {
+    const est = Math.floor(Math.log((xp * (XP_GROWTH - 1)) / XP_BASE + 1) / Math.log(XP_GROWTH));
+    n = Math.max(0, est);
+  }
+  while (totalXpForLevel(n + 1) <= xp) n++;
+  while (n > 0 && totalXpForLevel(n) > xp) n--; // safety
   return n;
 }
 
 function xpForNext(level) {
-  return Math.ceil(100 * Math.pow(level + 1, 1.5));
+  // Return the cumulative XP threshold for the *next* level
+  return totalXpForLevel(level + 1);
 }
 
 function ensureXpEntry(key) {
@@ -345,8 +395,10 @@ function startNewbieSweep() {
 async function ensureCrownRoles(guild) {
   let textRole = guild.roles.cache.find(r => r.name === TEXT_CHAMP_ROLE_NAME);
   if (!textRole) textRole = await guild.roles.create({ name: TEXT_CHAMP_ROLE_NAME, hoist: true, reason: 'Top text crown' }).catch(() => null);
+  else { try { await textRole.setHoist?.(true); } catch {} }
   let voiceRole = guild.roles.cache.find(r => r.name === VOICE_CHAMP_ROLE_NAME);
   if (!voiceRole) voiceRole = await guild.roles.create({ name: VOICE_CHAMP_ROLE_NAME, hoist: true, reason: 'Top voice crown' }).catch(() => null);
+  else { try { await voiceRole.setHoist?.(true); } catch {} }
   if (!textRole || !voiceRole) return { textRole, voiceRole };
 
   // Try to set Unicode emoji icons on the roles (server must support role icons)
@@ -392,51 +444,49 @@ async function updateCrownRoles(guild) {
 
   async function assign(role, winnerId) {
     const members = await guild.members.fetch();
+    // If we don't have a winner (e.g., scoreboard empty after a reboot), KEEP current holder to avoid wiping crowns
+    if (!winnerId) {
+      // still ensure nick format for current holder(s)
+      for (const m of members.values()) {
+        if (m.roles.cache.has(role.id)) await setNickRoleBadge(m);
+      }
+      return;
+    }
+    // Remove from all who aren't the current winner
     for (const m of members.values()) {
       if (m.roles.cache.has(role.id) && m.id !== winnerId) {
         await m.roles.remove(role).catch(() => {});
         await setNickRoleBadge(m);
       }
     }
-    if (winnerId) {
-      const wm = await guild.members.fetch(winnerId).catch(() => null);
-      if (wm && !wm.roles.cache.has(role.id)) {
-        await wm.roles.add(role, 'Crown role assignment').catch(() => {});
-      }
-      if (wm) await setNickRoleBadge(wm);
+    // Grant to winner
+    const wm = await guild.members.fetch(winnerId).catch(() => null);
+    if (wm && !wm.roles.cache.has(role.id)) {
+      await wm.roles.add(role, 'Crown role assignment').catch(() => {});
     }
+    if (wm) await setNickRoleBadge(wm);
   }
 
   await assign(textRole, newTextId);
   await assign(voiceRole, newVoiceId);
 
-  // Announcements
-  const lvlCh = getLevelUpChannel(guild);
-  if (!lvlCh) return;
-
+  // Announcements (only when we have a concrete new winner)
   // Double-crown announcement if both changed and go to same user
-  if (newTextId !== prevTextId && newVoiceId !== prevVoiceId && newTextId && newTextId === newVoiceId) {
+  const bothChanged = newTextId && newVoiceId && newTextId !== prevTextId && newVoiceId !== prevVoiceId && newTextId === newVoiceId;
+  if (bothChanged) {
     const member = await guild.members.fetch(newTextId).catch(() => null);
-    if (member) lvlCh.send({ content: `👑 Double crown: ${member} now rules **chat** ⌨ and **voice** 🎙. Bow or cope.` }).catch(() => {});
+    if (member) safeSendLevelUp(guild, { content: `👑 Double crown: ${member} now rules **chat** ⌨ and **voice** 🎙. Bow or cope.` });
     return;
   }
 
-  if (newTextId !== prevTextId) {
-    if (newTextId) {
-      const winner = await guild.members.fetch(newTextId).catch(() => null);
-      if (winner) lvlCh.send({ content: `⌨ New **Spam Lord**: ${winner} just snatched #1 in chat.` }).catch(() => {});
-    } else {
-      lvlCh.send({ content: `⌨ **Spam Lord** crown is now vacant. Type harder.` }).catch(() => {});
-    }
+  if (newTextId && newTextId !== prevTextId) {
+    const winner = await guild.members.fetch(newTextId).catch(() => null);
+    if (winner) safeSendLevelUp(guild, { content: `⌨ New **Spam Lord**: ${winner} just snatched #1 in chat.` });
   }
 
-  if (newVoiceId !== prevVoiceId) {
-    if (newVoiceId) {
-      const winner = await guild.members.fetch(newVoiceId).catch(() => null);
-      if (winner) lvlCh.send({ content: `🎙 New **Yap Lord**: ${winner} just took #1 in voice.` }).catch(() => {});
-    } else {
-      lvlCh.send({ content: `🎙 **Yap Lord** crown is now vacant. VC is quiet… too quiet.` }).catch(() => {});
-    }
+  if (newVoiceId && newVoiceId !== prevVoiceId) {
+    const winner = await guild.members.fetch(newVoiceId).catch(() => null);
+    if (winner) safeSendLevelUp(guild, { content: `🎙 New **Yap Lord**: ${winner} just took #1 in voice.` });
   }
 }
 
@@ -467,7 +517,7 @@ client.on('messageCreate', async (message) => {
       .setDescription(`${message.author} just hit **level ${lvl}** — keep it weird.`)
       .setTimestamp(new Date());
     const lvlCh = getLevelUpChannel(message.guild);
-    if (lvlCh) lvlCh.send({ embeds: [embed] }).catch(() => {});
+    safeSendLevelUp(message.guild, { embeds: [embed] }, message.channel);
   }
 });
 
@@ -500,8 +550,7 @@ function startVoiceTicker() {
         const res = addXP(gid, uid, VOICE_XP_PER_MIN, 'voice');
         if (res.levelUp) {
           const lvl = res.newLevel;
-          const lvlCh = getLevelUpChannel(guild);
-          lvlCh?.send({ content: `🎙️ Level Up: ${member} is now **level ${lvl}**.` }).catch(() => {});
+          safeSendLevelUp(guild, { content: `🎙️ Level Up: ${member} is now **level ${lvl}**.` });
         }
       }
     }
@@ -709,7 +758,53 @@ client.on('interactionCreate', async (interaction) => {
     return void interaction.reply({ embeds: [embed] });
   }
 
-    // COMMAND: /REFRESHCROWNS (ADMIN)
+    // COMMAND: /GIVEXP (ADMIN)
+  if (interaction.commandName === 'givexp') {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return void interaction.reply({ content: 'You need **Manage Server**.', ephemeral: true });
+    }
+    const user = interaction.options.getUser('user', true);
+    const amount = interaction.options.getInteger('amount', true);
+    const source = interaction.options.getString('source') || 'text';
+    const res = addXP(interaction.guildId, user.id, amount, source);
+
+    const payload = { content: `⚙️ Granted **${amount} ${source} XP** to <@${user.id}>${res.levelUp ? ` — **Level ${res.newLevel}!**` : ''}` };
+    safeSendLevelUp(interaction.guild, payload);
+    return void interaction.reply({ content: 'Done.', ephemeral: true });
+  }
+  // COMMAND: /RESETXP (ADMIN)
+  if (interaction.commandName === 'resetxp') {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return void interaction.reply({ content: 'You need **Manage Server** to do that.', ephemeral: true });
+    }
+    const ok = interaction.options.getBoolean('confirm', true);
+    if (!ok) {
+      return void interaction.reply({ content: 'Reset aborted (confirm=false).', ephemeral: true });
+    }
+
+    const gid = interaction.guildId;
+    let affected = 0;
+    for (const [k, v] of Object.entries(DB.xp)) {
+      if (k.startsWith(gid + ':')) {
+        v.xp = 0; v.text = 0; v.voice = 0; DB.xp[k] = v; affected++;
+      }
+    }
+    saveData();
+
+    // Remove crowns from everyone for a clean restart
+    const guild = interaction.guild;
+    const { textRole, voiceRole } = await ensureCrownRoles(guild);
+    const members = await guild.members.fetch();
+    for (const m of members.values()) {
+      if (textRole && m.roles.cache.has(textRole.id)) { try { await m.roles.remove(textRole, 'XP reset'); } catch {} }
+      if (voiceRole && m.roles.cache.has(voiceRole.id)) { try { await m.roles.remove(voiceRole, 'XP reset'); } catch {} }
+      await setNickRoleBadge(m);
+    }
+
+    safeSendLevelUp(guild, { content: `🧹 XP reset complete — all members set to **0** (text + voice). Crowns cleared. Good luck, have fun.` });
+    return void interaction.reply({ content: `✅ Reset done. ${affected} entries zeroed.`, ephemeral: true });
+  }
+  // COMMAND: /REFRESHCROWNS (ADMIN)
   if (interaction.commandName === 'refreshcrowns') {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
       return void interaction.reply({ content: 'You need **Manage Server** to do that.', ephemeral: true });
@@ -822,15 +917,3 @@ registerCommands().then(() => client.login(process.env.TOKEN));
 //     plan: free
 //     buildCommand: "npm ci"
 //     startCommand: "node bot.js"
-//     healthCheckPath: "/health"
-//     autoDeploy: true
-//     envVars:
-//       - key: TOKEN
-//         sync: false
-//       - key: CLIENT_ID
-//         sync: false
-//       - key: GUILD_ID
-//         sync: false
-//       - key: SELF_PING_URL
-//         value: "https://<your-service>.onrender.com/health"
-// ============================================================================
