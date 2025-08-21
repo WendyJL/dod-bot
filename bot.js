@@ -41,8 +41,8 @@ const MESSAGE_COOLDOWN_MS = 60 * 1000; // 1 MIN PER USER
 // XP CURVE (EXPONENTIAL): XP needed per level grows by a multiplier
 // Level 1 requires XP_BASE; each next level requires previous * XP_GROWTH
 // Cumulative XP to reach level N is geometric sum
-const XP_BASE = 100;    // XP required for level 1
-const XP_GROWTH = 1.25; // multiplier per level (e.g., 1.25 = +25% per level)
+const XP_BASE = 150;    // XP required for level 1
+const XP_GROWTH = 2.5; // multiplier per level (e.g., 1.25 = +25% per level)
 
 
 // CROWN ROLES FOR TOP TEXT/VOICE
